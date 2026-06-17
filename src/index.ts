@@ -2,7 +2,7 @@
 import { MCPStdioServer } from "./servers/stdio-server.js";
 import { MCPStreamHTTPServer } from "./servers/http-server.js";
 import { parseArgs, getDefaultImageStorageDirectory } from "./utils/index.js";
-import { DEFAULT_PORT, DEFAULT_TRANSPORT, Transport } from "./types/index.js";
+import { DEFAULT_CLIENT_SOURCE_BY_TRANSPORT, DEFAULT_PORT, DEFAULT_TRANSPORT, Transport } from "./types/index.js";
 
 function parseConfig() {
   const args = parseArgs();
@@ -20,6 +20,8 @@ function parseConfig() {
 
   const port = parseInt(args["port"], 10) || DEFAULT_PORT;
   const enableClientKey = args["enable-client-key"] === "true" || args["enable-client-key"] === "";
+  const clientSource = args["client-source"] || DEFAULT_CLIENT_SOURCE_BY_TRANSPORT[transport];
+  const sseEnabled = process.env.DINOX_MCP_SSE_ENABLED !== "false";
   let imageStorageDirectory = process.env.IMAGE_STORAGE_DIRECTORY;
   let authToken = process.env.AUTH_TOKEN;
 
@@ -45,7 +47,7 @@ function parseConfig() {
     imageStorageDirectory = getDefaultImageStorageDirectory();
   }
 
-  return { apiKey, transport, port, imageStorageDirectory, authToken, enableClientKey };
+  return { apiKey, transport, port, imageStorageDirectory, authToken, enableClientKey, clientSource, sseEnabled };
 }
 
 async function startMCPServer() {

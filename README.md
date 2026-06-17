@@ -51,7 +51,7 @@ Apply on the DINO-X platform: [Request API Key](https://cloud.deepdataspace.com/
 
 ### 3. Configure MCP
 
-#### Option A: Official Hosted Streamable HTTP (Recommended)
+**Option A: Official Hosted Streamable HTTP (Recommended)**
 
 Add to your MCP client config and replace with your API key:
 
@@ -65,7 +65,7 @@ Add to your MCP client config and replace with your API key:
 }
 ```
 
-#### Option B: Use the NPM package locally (STDIO)
+**Option B: Use the NPM package locally (STDIO)**
 
 Install Node.js first 
 
@@ -112,7 +112,7 @@ Configure your MCP client:
 ```
 Note: Replace `your-api-key-here` with your real key.
 
-#### Option C: Run from source locally
+**Option C: Run from source locally**
 
 Make sure Node.js is installed (see Option B), then:
 
@@ -158,6 +158,7 @@ Configure your MCP client:
   - `DINOX_API_KEY` (required/conditionally required): DINO-X platform API key
   - `IMAGE_STORAGE_DIRECTORY` (optional, STDIO): directory to save annotated images
   - `AUTH_TOKEN` (optional, HTTP): if set, client must send `Authorization: Bearer <token>`
+  - `DINOX_MCP_SSE_ENABLED` (optional, HTTP): set to `false` to reject `GET /mcp` SSE requests
 
   Examples:
 
@@ -173,6 +174,9 @@ node build/index.js --http --dinox-api-key=your-api-key --port=8080
 
 # Streamable HTTP (require client-provided API key via URL)
 node build/index.js --http --enable-client-key
+
+# Streamable HTTP (disable GET SSE, useful for serverless deployments)
+DINOX_MCP_SSE_ENABLED=false node build/index.js --http --enable-client-key
 ```
 
 

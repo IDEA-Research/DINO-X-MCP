@@ -62,6 +62,7 @@ export class MCPStreamHTTPServer {
       apiKey,
       baseUrl: BASE_URL,
       timeout: DEFAULT_TIMEOUT,
+      clientSource: this.config.clientSource,
     });
   }
 
@@ -149,6 +150,11 @@ export class MCPStreamHTTPServer {
   private getImageUriScheme(imageFileUri: string): string {
     const match = imageFileUri.match(/^([a-zA-Z][a-zA-Z0-9+.-]*):/);
     return match?.[1] || "unknown";
+  }
+
+  private isSseRequest(req: express.Request): boolean {
+    const acceptHeader = this.getRequestHeader(req, "accept");
+    return req.method === "GET" && !!acceptHeader?.includes("text/event-stream");
   }
 
   private registerTools(server: McpServer): void {
@@ -548,6 +554,23 @@ export class MCPStreamHTTPServer {
 
     app.all('/mcp', authMiddleware, async (req, res) => {
       try {
+        if (this.config.sseEnabled === false && this.isSseRequest(req)) {
+          logEvent("mcp_sse_rejected", {
+            reason: "sse_disabled",
+            ...this.getHttpRequestLogFields(req),
+          });
+
+          res.status(405).json({
+            jsonrpc: "2.0",
+            error: {
+              code: -32000,
+              message: "SSE is disabled for this MCP endpoint",
+            },
+            id: null,
+          });
+          return;
+        }
+
         logEvent("mcp_rpc_request_start", {
           http_method: req.method,
           route_path: req.path,

@@ -54,7 +54,7 @@ DINO-X MCP 支持两种传输模式:
 
 ### 3. 配置 MCP
 
-#### 方式 A：使用官方托管的 Streamable HTTP（推荐）
+**方式 A：使用官方托管的 Streamable HTTP（推荐）**
 
 在客户端配置文件中添加，替换自己的 API Key：
 
@@ -69,7 +69,7 @@ DINO-X MCP 支持两种传输模式:
 
 ```
 
-#### 方式 B：使用 NPM 包本地运行（STDIO）
+**方式 B：使用 NPM 包本地运行（STDIO）**
 
 首先，需要本地安装 `Node.js` 环境，可以从 [Node.js 官网](https://nodejs.org/) 下载安装包，或使用命令安装：
 
@@ -124,7 +124,7 @@ choco install nodejs-lts -y
 
 注意：获取 API Key 后，把上面配置中的 `you-api-key-here` 替换成真正的密钥。
 
-#### 方式 C：克隆源码本地运行
+**方式 C：克隆源码本地运行**
 
 首先，需要本地安装 `Node.js` 环境（参考方式二）
 
@@ -170,6 +170,7 @@ MCP 客户端中配置：
   - `DINOX_API_KEY`（必需/条件必需）：DINO-X 平台鉴权密钥
   - `IMAGE_STORAGE_DIRECTORY`（可选，STDIO 模式）：可视化图片输出目录
   - `AUTH_TOKEN`（可选，Streamable HTTP 模式）：若设置，则需客户端请求头携带 `Authorization: Bearer <token>`
+  - `DINOX_MCP_SSE_ENABLED`（可选，Streamable HTTP 模式）：设置为 `false` 时拒绝 `GET /mcp` SSE 请求
 
 示例：
 ```bash
@@ -184,6 +185,9 @@ node build/index.js --http --dinox-api-key=your-api-key --port=8080
 
 # Streamable HTTP（强制客户端提供 API Key）
 node build/index.js --http --enable-client-key
+
+# Streamable HTTP（关闭 GET SSE，适用于 Serverless 部署）
+DINOX_MCP_SSE_ENABLED=false node build/index.js --http --enable-client-key
 
 # 此时，客户端需要通过 ?key= 传入
 {

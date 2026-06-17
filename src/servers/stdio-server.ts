@@ -22,6 +22,7 @@ export class MCPStdioServer {
       apiKey: this.config.apiKey!,
       baseUrl: BASE_URL,
       timeout: DEFAULT_TIMEOUT,
+      clientSource: this.config.clientSource,
     });
 
     this.server = new McpServer({
@@ -350,4 +351,3 @@ export class MCPStdioServer {
     console.error("DINO-X MCP server running on STDIO transport.");
   }
 }
-
