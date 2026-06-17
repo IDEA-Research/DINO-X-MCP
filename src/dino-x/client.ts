@@ -2,6 +2,7 @@ import axios, { AxiosInstance } from "axios";
 import fs from "fs";
 import { fileURLToPath } from 'url';
 import { APIResponse, TaskResponse } from "../types/index.js";
+import { logError, logEvent } from "../utils/observability.js";
 
 export interface DinoXApiConfig {
   apiKey: string;
@@ -59,38 +60,75 @@ export class DinoXApiClient {
       throw new Error("API Key is missing");
     }
 
+    const taskCreateStartedAt = Date.now();
+    logEvent("dinox_task_create_start", {
+      api_endpoint: endpoint,
+    });
+
     try {
       const response = await this.axiosClient.post(
         `task/${endpoint}`,
         payload
       );
 
+      const taskUuid = response.data.data?.task_uuid;
+      logEvent("dinox_task_create_finish", {
+        api_endpoint: endpoint,
+        api_status_code: response.status,
+        api_code: response.data.code,
+        api_task_uuid: taskUuid,
+        duration_ms: Date.now() - taskCreateStartedAt,
+      });
+
       if (response.data.code !== 0) {
         throw new Error(`Failed to create task: ${response.data.msg}`);
       }
 
-      const taskUuid = response.data.data.task_uuid;
-
       const maxRetries = 60;
       const retryInterval = 1000;
       let retryCount = 0;
+      let lastStatus: string | undefined;
 
       while (retryCount < maxRetries) {
+        const pollStartedAt = Date.now();
         const statusResponse = await this.axiosClient.get<TaskResponse<T>>(
           `task_status/${taskUuid}`,
         );
 
         const status = statusResponse.data;
+        const taskStatus = status.data.status;
+        const shouldLogPoll =
+          taskStatus !== lastStatus ||
+          taskStatus === "success" ||
+          taskStatus === "failed" ||
+          retryCount % 10 === 0;
 
-        if (status.data.status === "failed") {
+        if (shouldLogPoll) {
+          logEvent("dinox_task_status_poll", {
+            api_endpoint: endpoint,
+            api_task_uuid: taskUuid,
+            api_status_code: statusResponse.status,
+            task_status: taskStatus,
+            retry_count: retryCount,
+            duration_ms: Date.now() - pollStartedAt,
+          });
+        }
+        lastStatus = taskStatus;
+
+        if (taskStatus === "failed") {
           throw new Error(status.data.error || "Task failed");
         }
 
-        if (status.data.status === "success" && status.data.result) {
+        if (taskStatus === "success" && status.data.result) {
+          logEvent("dinox_task_success", {
+            api_endpoint: endpoint,
+            api_task_uuid: taskUuid,
+            retry_count: retryCount,
+          });
           return status.data.result;
         }
 
-        if (status.data.status === "waiting" || status.data.status === "running") {
+        if (taskStatus === "waiting" || taskStatus === "running") {
           await new Promise(resolve => setTimeout(resolve, retryInterval));
           retryCount++;
           continue;
@@ -101,7 +139,9 @@ export class DinoXApiClient {
 
       throw new Error("Task polling timeout");
     } catch (error) {
-      console.error("API request error:", error);
+      logError("dinox_task_error", error, {
+        api_endpoint: endpoint,
+      });
       if (axios.isAxiosError(error) && error.response) {
         const data = error.response.data;
         if (error.response.status === 400) {
@@ -178,7 +218,7 @@ export class DinoXApiClient {
 
       return await this.addDescriptions(imageDataUri, detectionRsp);
     } catch (error) {
-      console.error("API request error:", error);
+      logError("dinox_detection_error", error);
       throw error;
     }
   }

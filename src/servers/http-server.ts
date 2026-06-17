@@ -6,34 +6,37 @@ import { parseBbox, parsePoseKeypoints } from "../utils/index.js";
 import { Config, ResultCategory } from "../types/index.js";
 import express from "express";
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { AsyncLocalStorage } from "async_hooks";
+import { randomUUID } from "crypto";
+import { logError, logEvent, runWithRequestLogContext } from "../utils/observability.js";
 
 /**
  * MCP Server class for managing DINO-X MCP server configuration and functionality
  * Specifically designed for Streamable HTTP transport mode
  */
 export class MCPStreamHTTPServer {
-  private server!: McpServer;
   private config!: Config;
-  private api!: DinoXApiClient;
+  private defaultApi?: DinoXApiClient;
+  private requestApiClients = new AsyncLocalStorage<DinoXApiClient>();
 
   constructor(customConfig: Config) {
     this.config = customConfig;
 
     // Create default API client if apiKey is provided in config
     if (this.config.apiKey) {
-      this.api = new DinoXApiClient({
-        apiKey: this.config.apiKey,
-        baseUrl: BASE_URL,
-        timeout: DEFAULT_TIMEOUT,
-      });
+      this.defaultApi = this.createApiClient(this.config.apiKey);
     }
 
-    this.server = new McpServer({
+  }
+
+  private createMcpServer(): McpServer {
+    const server = new McpServer({
       name: 'dinox-mcp-server',
       version: '1.0.0',
     });
 
-    this.registerTools();
+    this.registerTools(server);
+    return server;
   }
 
   /**
@@ -54,27 +57,109 @@ export class MCPStreamHTTPServer {
     );
   }
 
-  /**
-   * Set API client for current request
-   * @param apiKey API key string
-   */
-  private setApiClient(apiKey: string): void {
-    this.api = new DinoXApiClient({
+  private createApiClient(apiKey: string): DinoXApiClient {
+    return new DinoXApiClient({
       apiKey,
       baseUrl: BASE_URL,
       timeout: DEFAULT_TIMEOUT,
     });
   }
 
-  private registerTools(): void {
-    this.registerDetectByTextTool();
-    this.registerDetectAllObjectsTool();
-    this.registerDetectHumanPoseKeypointsTool();
+  private getApiClient(): DinoXApiClient {
+    const requestApiClient = this.requestApiClients.getStore();
+    if (requestApiClient) {
+      return requestApiClient;
+    }
+
+    if (this.defaultApi) {
+      return this.defaultApi;
+    }
+
+    throw new Error("API client is not configured");
   }
 
-  private registerDetectByTextTool(): void {
+  private getRequestIdFromRequest(req: express.Request): string {
+    const requestIdHeader = req.headers["x-fc-request-id"] || req.headers["x-request-id"];
+    if (Array.isArray(requestIdHeader)) {
+      return requestIdHeader[0] || randomUUID();
+    }
+
+    return requestIdHeader || randomUUID();
+  }
+
+  private getClientIp(req: express.Request): string | undefined {
+    const forwardedFor = req.headers["x-forwarded-for"];
+    if (typeof forwardedFor === "string" && forwardedFor.trim()) {
+      return forwardedFor.split(",")[0].trim();
+    }
+
+    return req.ip;
+  }
+
+  private getRequestHeader(req: express.Request, name: string): string | undefined {
+    const value = req.headers[name.toLowerCase()];
+    if (Array.isArray(value)) {
+      return value.join(",");
+    }
+
+    return value;
+  }
+
+  private getHttpRequestLogFields(req: express.Request): Record<string, unknown> {
+    return {
+      http_method: req.method,
+      route_path: req.path,
+      client_ip: this.getClientIp(req),
+      query_has_key: typeof req.query.key === "string" && req.query.key.trim().length > 0,
+      user_agent: this.getRequestHeader(req, "user-agent"),
+      accept: this.getRequestHeader(req, "accept"),
+      content_type: this.getRequestHeader(req, "content-type"),
+      content_length: this.getRequestHeader(req, "content-length"),
+      mcp_protocol_version: this.getRequestHeader(req, "mcp-protocol-version"),
+    };
+  }
+
+  private getJsonRpcSummary(body: unknown): Record<string, unknown> {
+    const messages = Array.isArray(body) ? body : [body];
+    const methods: string[] = [];
+    const toolNames: string[] = [];
+
+    for (const message of messages) {
+      if (!message || typeof message !== "object") {
+        continue;
+      }
+
+      const candidate = message as { method?: unknown; params?: { name?: unknown } };
+      if (typeof candidate.method === "string") {
+        methods.push(candidate.method);
+      }
+
+      if (candidate.method === "tools/call" && typeof candidate.params?.name === "string") {
+        toolNames.push(candidate.params.name);
+      }
+    }
+
+    return {
+      jsonrpc_batch_size: messages.length,
+      jsonrpc_methods: methods,
+      tool_names: toolNames,
+    };
+  }
+
+  private getImageUriScheme(imageFileUri: string): string {
+    const match = imageFileUri.match(/^([a-zA-Z][a-zA-Z0-9+.-]*):/);
+    return match?.[1] || "unknown";
+  }
+
+  private registerTools(server: McpServer): void {
+    this.registerDetectByTextTool(server);
+    this.registerDetectAllObjectsTool(server);
+    this.registerDetectHumanPoseKeypointsTool(server);
+  }
+
+  private registerDetectByTextTool(server: McpServer): void {
     const { name, description } = ToolConfigs[Tool.DETECT_BY_TEXT];
-    this.server.tool(
+    server.tool(
       name,
       description,
       {
@@ -87,6 +172,10 @@ export class MCPStreamHTTPServer {
           const { imageFileUri, textPrompt, includeDescription } = args;
 
           if (!imageFileUri || !textPrompt) {
+            logEvent("mcp_tool_call_rejected", {
+              tool_name: name,
+              reason: "missing_image_or_text_prompt",
+            });
             return {
               content: [
                 {
@@ -97,7 +186,14 @@ export class MCPStreamHTTPServer {
             }
           }
 
-          const { objects } = await this.api.detectObjectsByText(imageFileUri, textPrompt, includeDescription);
+          logEvent("mcp_tool_call_start", {
+            tool_name: name,
+            include_description: includeDescription,
+            image_uri_scheme: this.getImageUriScheme(imageFileUri),
+            text_prompt_length: textPrompt.length,
+          });
+
+          const { objects } = await this.getApiClient().detectObjectsByText(imageFileUri, textPrompt, includeDescription);
 
           const categories: ResultCategory = {};
           for (const object of objects) {
@@ -116,6 +212,11 @@ export class MCPStreamHTTPServer {
                 description: obj.caption,
               } : {}),
             }
+          });
+
+          logEvent("mcp_tool_call_success", {
+            tool_name: name,
+            object_count: objectsInfo.length,
           });
 
           return {
@@ -137,6 +238,9 @@ export class MCPStreamHTTPServer {
             ]
           };
         } catch (error) {
+          logError("mcp_tool_call_error", error, {
+            tool_name: name,
+          });
           return {
             content: [
               {
@@ -150,9 +254,9 @@ export class MCPStreamHTTPServer {
     )
   }
 
-  private registerDetectAllObjectsTool(): void {
+  private registerDetectAllObjectsTool(server: McpServer): void {
     const { name, description } = ToolConfigs[Tool.DETECT_ALL_OBJECTS];
-    this.server.tool(
+    server.tool(
       name,
       description,
       {
@@ -164,6 +268,10 @@ export class MCPStreamHTTPServer {
           const { imageFileUri, includeDescription } = args;
 
           if (!imageFileUri) {
+            logEvent("mcp_tool_call_rejected", {
+              tool_name: name,
+              reason: "missing_image_uri",
+            });
             return {
               content: [
                 {
@@ -174,7 +282,13 @@ export class MCPStreamHTTPServer {
             }
           }
 
-          const { objects } = await this.api.detectAllObjects(imageFileUri, includeDescription);
+          logEvent("mcp_tool_call_start", {
+            tool_name: name,
+            include_description: includeDescription,
+            image_uri_scheme: this.getImageUriScheme(imageFileUri),
+          });
+
+          const { objects } = await this.getApiClient().detectAllObjects(imageFileUri, includeDescription);
           const categories: ResultCategory = {};
 
           for (const object of objects) {
@@ -193,6 +307,11 @@ export class MCPStreamHTTPServer {
                 description: obj.caption,
               } : {}),
             }
+          });
+
+          logEvent("mcp_tool_call_success", {
+            tool_name: name,
+            object_count: objectsInfo.length,
           });
 
           return {
@@ -214,6 +333,9 @@ export class MCPStreamHTTPServer {
             ]
           };
         } catch (error) {
+          logError("mcp_tool_call_error", error, {
+            tool_name: name,
+          });
           return {
             content: [
               {
@@ -227,9 +349,9 @@ export class MCPStreamHTTPServer {
     )
   }
 
-  private registerDetectHumanPoseKeypointsTool(): void {
+  private registerDetectHumanPoseKeypointsTool(server: McpServer): void {
     const { name, description } = ToolConfigs[Tool.DETECT_HUMAN_POSE_KEYPOINTS];
-    this.server.tool(
+    server.tool(
       name,
       description,
       {
@@ -241,6 +363,10 @@ export class MCPStreamHTTPServer {
           const { imageFileUri, includeDescription } = args;
 
           if (!imageFileUri) {
+            logEvent("mcp_tool_call_rejected", {
+              tool_name: name,
+              reason: "missing_image_uri",
+            });
             return {
               content: [
                 {
@@ -251,7 +377,13 @@ export class MCPStreamHTTPServer {
             }
           }
 
-          const { objects } = await this.api.detectHumanPoseKeypoints(imageFileUri, includeDescription);
+          logEvent("mcp_tool_call_start", {
+            tool_name: name,
+            include_description: includeDescription,
+            image_uri_scheme: this.getImageUriScheme(imageFileUri),
+          });
+
+          const { objects } = await this.getApiClient().detectHumanPoseKeypoints(imageFileUri, includeDescription);
 
           const categories: ResultCategory = {};
           for (const object of objects) {
@@ -275,6 +407,11 @@ export class MCPStreamHTTPServer {
             }
           });
 
+          logEvent("mcp_tool_call_success", {
+            tool_name: name,
+            object_count: objectsInfo.length,
+          });
+
           return {
             content: [
               {
@@ -292,6 +429,9 @@ export class MCPStreamHTTPServer {
             ]
           };
         } catch (error) {
+          logError("mcp_tool_call_error", error, {
+            tool_name: name,
+          });
           return {
             content: [
               {
@@ -309,7 +449,65 @@ export class MCPStreamHTTPServer {
     console.error("Starting DINO-X MCP server on Streamable HTTP transport...");
 
     const app = express();
+    app.set("trust proxy", true);
+
+    app.use((req, res, next) => {
+      const requestId = this.getRequestIdFromRequest(req);
+      const startedAt = Date.now();
+      let finished = false;
+
+      runWithRequestLogContext({ requestId }, () => {
+        logEvent("mcp_http_request_start", this.getHttpRequestLogFields(req));
+
+        res.on("finish", () => {
+          finished = true;
+          logEvent("mcp_http_request_finish", {
+            ...this.getHttpRequestLogFields(req),
+            status_code: res.statusCode,
+            duration_ms: Date.now() - startedAt,
+            ...this.getJsonRpcSummary(req.body),
+          });
+        });
+
+        res.on("close", () => {
+          if (finished) {
+            return;
+          }
+
+          logEvent("mcp_http_request_closed", {
+            ...this.getHttpRequestLogFields(req),
+            status_code: res.statusCode,
+            duration_ms: Date.now() - startedAt,
+            request_aborted: req.aborted,
+            response_writable_ended: res.writableEnded,
+          });
+        });
+
+        next();
+      });
+    });
+
     app.use(express.json());
+
+    app.use((error: unknown, req: express.Request, res: express.Response, next: express.NextFunction) => {
+      if (!error) {
+        return next();
+      }
+
+      logError("mcp_http_body_parse_error", error, this.getHttpRequestLogFields(req));
+      if (!res.headersSent) {
+        return res.status(400).json({
+          jsonrpc: "2.0",
+          error: {
+            code: -32700,
+            message: "Parse error",
+          },
+          id: null,
+        });
+      }
+
+      next(error);
+    });
 
     const authToken = this.config.authToken;
 
@@ -318,9 +516,15 @@ export class MCPStreamHTTPServer {
       if (this.config.enableClientKey) {
         try {
           const apiKey = this.getApiKeyFromRequest(req);
-          this.setApiClient(apiKey);
+          const apiClient = this.createApiClient(apiKey);
+
+          return this.validateAuthToken(req, res, authToken, () => {
+            this.requestApiClients.run(apiClient, () => next());
+          });
         } catch (apiKeyError) {
-          console.error('API Key error:', apiKeyError);
+          logError("mcp_auth_failed", apiKeyError, {
+            reason: "missing_or_invalid_api_key",
+          });
           return res.status(401).json({
             jsonrpc: '2.0',
             error: {
@@ -332,49 +536,34 @@ export class MCPStreamHTTPServer {
         }
       }
 
-      // Handle auth token validation if configured
-      if (!authToken) {
-        return next();
-      }
+      return this.validateAuthToken(req, res, authToken, () => {
+        if (this.defaultApi) {
+          this.requestApiClients.run(this.defaultApi, () => next());
+          return;
+        }
 
-      const authHeader = req.headers.authorization;
-      if (!authHeader || !authHeader.startsWith("Bearer ")) {
-        return res.status(401).json({
-          jsonrpc: "2.0",
-          error: {
-            code: -32000,
-            message: "Unauthorized: Missing or invalid Authorization header",
-          },
-          id: null,
-        });
-      }
-
-      const token = authHeader.substring(7);
-      if (token !== authToken) {
-        return res.status(401).json({
-          jsonrpc: "2.0",
-          error: {
-            code: -32000,
-            message: "Unauthorized: Invalid token",
-          },
-          id: null,
-        });
-      }
-
-      next();
+        next();
+      });
     };
 
     app.all('/mcp', authMiddleware, async (req, res) => {
       try {
+        logEvent("mcp_rpc_request_start", {
+          http_method: req.method,
+          route_path: req.path,
+          ...this.getJsonRpcSummary(req.body),
+        });
+
         const transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: undefined
         })
+        const server = this.createMcpServer();
 
-        await this.server.connect(transport);
+        await server.connect(transport);
 
         await transport.handleRequest(req, res, req.body);
       } catch (error) {
-        console.error('Error handling MCP request:', error);
+        logError("mcp_rpc_request_error", error);
         if (!res.headersSent) {
           res.status(500).json({
             jsonrpc: '2.0',
@@ -395,5 +584,49 @@ export class MCPStreamHTTPServer {
       }
     });
   }
-}
 
+  private validateAuthToken(
+    req: express.Request,
+    res: express.Response,
+    authToken: string | undefined,
+    onAuthorized: () => void
+  ): void | express.Response {
+    // Handle auth token validation if configured
+    if (!authToken) {
+      onAuthorized();
+      return;
+    }
+
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      logEvent("mcp_auth_failed", {
+        reason: "missing_authorization_header",
+      });
+      return res.status(401).json({
+        jsonrpc: "2.0",
+        error: {
+          code: -32000,
+          message: "Unauthorized: Missing or invalid Authorization header",
+        },
+        id: null,
+      });
+    }
+
+    const token = authHeader.substring(7);
+    if (token !== authToken) {
+      logEvent("mcp_auth_failed", {
+        reason: "invalid_token",
+      });
+      return res.status(401).json({
+        jsonrpc: "2.0",
+        error: {
+          code: -32000,
+          message: "Unauthorized: Invalid token",
+        },
+        id: null,
+      });
+    }
+
+    onAuthorized();
+  }
+}
